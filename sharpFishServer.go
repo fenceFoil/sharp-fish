@@ -10,6 +10,7 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 	"text/template"
 )
@@ -23,6 +24,20 @@ func coordsToString(coords []float64) string {
 		panic(err)
 	}
 	return strings.Trim(string(jsonArray), "[]")
+}
+
+type FishParams struct {
+	MainHue         float64
+	AccentHue       float64
+	HeightRatio     float64
+	BellyUpRatio    float64
+	MouthSizeRatio  float64
+	MouthOpenRatio  float64
+	EyeSize         float64
+	TailConcavity   float64
+	TailInsetRatio  float64
+	TailHeightRatio float64
+	TailLengthRatio float64
 }
 
 type FishPoints struct {
@@ -43,7 +58,99 @@ func fishDiamondPoints(centerX, centerY, width, height float64, bellyUpRatio flo
 	})
 }
 
-func generateFish(rand *rand.Rand) FishPoints {
+func digit(str string, i int) float64 {
+	digit := float64(str[i] - 48)
+	if (str[i] - 48) == 0 {
+		return 0.003 // division by 0 is lame
+	} else {
+		return digit
+	}
+}
+
+func digitInt(str string, i int) int {
+	return int(str[i] - 48)
+}
+
+func barcodeToFishParams(barcode string) FishParams {
+	fishParams := FishParams{
+		MainHue:         digit(barcode, 10) * 36,
+		AccentHue:       digit(barcode, 4)*36 + 12, // offset hue to make things varied
+		HeightRatio:     digit(barcode, 8)/10*1.2 + 0.5,
+		BellyUpRatio:    digit(barcode, 0)/10*3.5 + 0.5,
+		EyeSize:         digit(barcode, 1)/10*0.5 + 0.8,
+		TailConcavity:   digit(barcode, 9) / 10 * 0.7,
+		TailInsetRatio:  digit(barcode, 3)/10*0.3 + 0.05,
+		TailHeightRatio: digit(barcode, 6)/10*0.95 + 0.05,
+		TailLengthRatio: digit(barcode, 5)/10*1 + 0.5,
+	}
+
+	// Really really really tall fish look broken
+	if fishParams.HeightRatio/fishParams.BellyUpRatio > 2.0 {
+		// Cap belly up ratio
+		fishParams.BellyUpRatio = fishParams.HeightRatio / 2
+	}
+
+	fishParams.MouthSizeRatio = (digit(barcode, 7) / 10) * 0.8
+	// Little mouths can open real wide
+	fishParams.MouthOpenRatio = ((digit(barcode, 2)/10)*0.9 + 0.1) * (1 / fishParams.MouthSizeRatio)
+
+	return fishParams
+}
+
+func generateControlledFish(params FishParams) FishPoints {
+	fish := FishPoints{
+		MainHue:   params.MainHue,
+		AccentHue: params.AccentHue,
+	}
+
+	// Constants
+	centerX := 300.0
+	centerY := 300.0
+	fishLength := 300.0
+
+	// Body stats: heightRatio, bellyUpRatio
+	heightRatio := params.HeightRatio
+	bellyUpRatio := params.BellyUpRatio
+
+	// Mouth stats: mouthSizeRatio, mouthOpenRatio
+	mouthSizeRatio := params.MouthSizeRatio
+	// Little mouths can open real wide
+	mouthOpenRatio := params.MouthOpenRatio
+
+	// Eye stats: eyeSize
+	eyeSize := params.EyeSize
+
+	// Tail stats: tailConcavity, tailInsetRatio, tailHeightRatio, tailLengthRatio
+	tailConcavity := params.TailConcavity
+	tailInsetRatio := params.TailInsetRatio
+	tailHeightRatio := params.TailHeightRatio
+	tailLengthRatio := params.TailLengthRatio
+
+	fishHeight := fishLength * heightRatio
+	fish.BodyCoords = fishDiamondPoints(centerX, centerY, fishLength, fishHeight, bellyUpRatio)
+
+	mouthHeight := fishLength * mouthSizeRatio * mouthOpenRatio
+	mouthWidth := fishLength * mouthSizeRatio
+	fish.MouthCoords = coordsToString([]float64{
+		centerX - fishLength/2 - 1, centerY,
+		centerX - fishLength/2, centerY - mouthHeight/2,
+		centerX - fishLength/2 + mouthWidth, centerY,
+		centerX - fishLength/2, centerY + mouthHeight/2,
+	})
+
+	fish.EyeCoords = fishDiamondPoints(centerX-fishLength*0.18, centerY-fishHeight*0.2, fishLength/10*eyeSize, fishLength/10*eyeSize, 1)
+
+	fish.TailCoords = coordsToString([]float64{
+		centerX + fishLength/2 - (tailInsetRatio * fishLength), centerY,
+		centerX + fishLength/2 - (tailInsetRatio * fishLength) + (fishLength / 2 * tailLengthRatio), centerY - (fishHeight / 2 * tailHeightRatio),
+		centerX + fishLength/2 - (tailInsetRatio * fishLength) + (fishLength/2*tailLengthRatio)*(1-tailConcavity), centerY,
+		centerX + fishLength/2 - (tailInsetRatio * fishLength) + fishLength/2*tailLengthRatio, centerY + (fishHeight/2)*tailHeightRatio,
+	})
+
+	return fish
+}
+
+func generateRandomFish(rand *rand.Rand) FishPoints {
 	fish := FishPoints{
 		MainHue:   float64(rand.Int32N(360)),
 		AccentHue: float64(rand.Int32N(360)),
@@ -122,16 +229,22 @@ func fishRequestHandler(w http.ResponseWriter, req *http.Request) {
 		panic(err)
 	}
 
-	seed1, seed2 := rand.Uint64(), rand.Uint64()
-	// If it's not a empty path, seed the fish!
-	if len(req.URL.Path[1:]) > 0 {
-		hash := sha1.Sum([]byte(req.URL.Path[1:]))
-		seed1 = binary.BigEndian.Uint64(hash[0:8])
-		seed2 = binary.BigEndian.Uint64(hash[8:16])
+	var fishPoints FishPoints
+	digitCheck := regexp.MustCompile(`^[0-9]+$`)
+	if len(req.URL.Path[1:]) == 11 && digitCheck.MatchString(req.URL.Path[1:]) {
+		fishPoints = generateControlledFish(barcodeToFishParams(req.URL.Path[1:]))
+	} else {
+		seed1, seed2 := rand.Uint64(), rand.Uint64()
+		// If it's not a empty path, seed the fish!
+		if len(req.URL.Path[1:]) > 0 {
+			hash := sha1.Sum([]byte(req.URL.Path[1:]))
+			seed1 = binary.BigEndian.Uint64(hash[0:8])
+			seed2 = binary.BigEndian.Uint64(hash[8:16])
+		}
+		fishPoints = generateRandomFish(rand.New(rand.NewPCG(seed1, seed2)))
 	}
-	// TODO: Check if it's a sequence of X digits. Use them as params if true
 
-	err = tmpl.Execute(w, generateFish(rand.New(rand.NewPCG(seed1, seed2))))
+	err = tmpl.Execute(w, fishPoints)
 	if err != nil {
 		panic(err)
 	}
